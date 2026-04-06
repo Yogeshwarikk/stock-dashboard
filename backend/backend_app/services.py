@@ -2,63 +2,79 @@ import requests
 import pandas as pd
 import os
 
-API_KEY = os.environ.get('ALPHA_VANTAGE_KEY', 'demo')
-BASE_URL = 'https://www.alphavantage.co/query'
-
 VOLUME_MA_WINDOW = 30
 VOLUME_THRESHOLD = 0.20
 
-# Map our intervals to Alpha Vantage functions
-INTERVAL_MAP = {
-    '1d':  ('TIME_SERIES_DAILY_ADJUSTED',  'Time Series (Daily)'),
-    '1wk': ('TIME_SERIES_WEEKLY_ADJUSTED', 'Weekly Adjusted Time Series'),
-    '1mo': ('TIME_SERIES_MONTHLY_ADJUSTED','Monthly Adjusted Time Series'),
-    '1y':  ('TIME_SERIES_MONTHLY_ADJUSTED','Monthly Adjusted Time Series'),
+INTERVAL_RANGE_MAP = {
+    '1d':  ('1y',  '1d'),
+    '1wk': ('2y',  '1wk'),
+    '1mo': ('5y',  '1mo'),
+    '1y':  ('10y', '3mo'),
 }
 
-# Alpha Vantage uses different symbol format (no .NS suffix)
-def convert_symbol(symbol: str) -> str:
-    if symbol == '^NSEI':
-        return 'NSEI'
-    if symbol.endswith('.NS'):
-        return symbol.replace('.NS', '.BSE')
-    return symbol
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'application/json',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Referer': 'https://finance.yahoo.com',
+}
 
 def fetch_stock_data(symbol: str = '^NSEI', interval: str = '1d') -> list[dict]:
-    av_symbol = convert_symbol(symbol)
-    func, series_key = INTERVAL_MAP.get(interval, INTERVAL_MAP['1d'])
+    range_val, interval_val = INTERVAL_RANGE_MAP.get(interval, ('1y', '1d'))
+
+    endpoints = [
+        'https://query1.finance.yahoo.com/v8/finance/chart/',
+        'https://query2.finance.yahoo.com/v8/finance/chart/',
+    ]
 
     params = {
-        'function':   func,
-        'symbol':     av_symbol,
-        'outputsize': 'full',
-        'apikey':     API_KEY,
+        'range':    range_val,
+        'interval': interval_val,
+        'events':   'history',
     }
 
-    try:
-        resp = requests.get(BASE_URL, params=params, timeout=30)
-        resp.raise_for_status()
-        json_data = resp.json()
-    except Exception as e:
-        raise RuntimeError(f'Alpha Vantage request failed: {e}')
+    data = None
+    for base in endpoints:
+        try:
+            url = f'{base}{requests.utils.quote(symbol)}'
+            resp = requests.get(url, params=params, headers=HEADERS, timeout=20)
+            resp.raise_for_status()
+            json_data = resp.json()
+            result_data = json_data.get('chart', {}).get('result', [])
+            if result_data:
+                data = result_data[0]
+                break
+        except Exception:
+            continue
 
-    if 'Information' in json_data:
-        raise RuntimeError('API rate limit reached. Wait 1 minute and retry.')
-
-    if series_key not in json_data:
+    if not data:
         return []
 
-    series = json_data[series_key]
+    timestamps = data.get('timestamp', [])
+    quotes = data.get('indicators', {}).get('quote', [{}])[0]
+
+    if not timestamps:
+        return []
+
+    opens   = quotes.get('open',   [])
+    highs   = quotes.get('high',   [])
+    lows    = quotes.get('low',    [])
+    closes  = quotes.get('close',  [])
+    volumes = quotes.get('volume', [])
+
     rows = []
-    for date_str, vals in series.items():
+    for i, ts in enumerate(timestamps):
         try:
+            close = closes[i] if i < len(closes) else None
+            if close is None:
+                continue
             rows.append({
-                'date':   date_str,
-                'open':   float(vals.get('1. open',            vals.get('1. open',  0))),
-                'high':   float(vals.get('2. high',            vals.get('2. high',  0))),
-                'low':    float(vals.get('3. low',             vals.get('3. low',   0))),
-                'close':  float(vals.get('5. adjusted close',  vals.get('4. close', 0))),
-                'volume': int(float(vals.get('6. volume',      vals.get('5. volume',0)))),
+                'date':   pd.Timestamp(ts, unit='s').strftime('%Y-%m-%d'),
+                'open':   round(float(opens[i]),  2) if i < len(opens)   and opens[i]   is not None else None,
+                'high':   round(float(highs[i]),  2) if i < len(highs)   and highs[i]   is not None else None,
+                'low':    round(float(lows[i]),   2) if i < len(lows)    and lows[i]    is not None else None,
+                'close':  round(float(close),     2),
+                'volume': int(volumes[i]) if i < len(volumes) and volumes[i] is not None else 0,
             })
         except Exception:
             continue
@@ -67,24 +83,17 @@ def fetch_stock_data(symbol: str = '^NSEI', interval: str = '1d') -> list[dict]:
         return []
 
     df = pd.DataFrame(rows)
-    df['date'] = pd.to_datetime(df['date'])
-    df = df.sort_values('date').reset_index(drop=True)
-
-    # Limit rows based on interval
-    limits = {'1d': 365, '1wk': 104, '1mo': 60, '1y': 120}
-    df = df.tail(limits.get(interval, 365))
-
     df['volume_ma30'] = df['volume'].rolling(window=VOLUME_MA_WINDOW, min_periods=1).mean()
     df['volume_high'] = df['volume'] > df['volume_ma30'] * (1 + VOLUME_THRESHOLD)
 
     result = []
     for _, row in df.iterrows():
         result.append({
-            'date':        row['date'].strftime('%Y-%m-%d'),
-            'open':        round(row['open'],  2),
-            'high':        round(row['high'],  2),
-            'low':         round(row['low'],   2),
-            'close':       round(row['close'], 2),
+            'date':        row['date'],
+            'open':        row['open'],
+            'high':        row['high'],
+            'low':         row['low'],
+            'close':       row['close'],
             'volume':      int(row['volume']),
             'volume_ma30': round(float(row['volume_ma30']), 2),
             'volume_high': bool(row['volume_high']),
