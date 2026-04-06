@@ -1,85 +1,90 @@
-import yfinance as yf
+import requests
 import pandas as pd
+import os
 
-INTERVAL_PERIOD_MAP = {
-    '1d':  ('1y',  '1d'),
-    '1wk': ('2y',  '1wk'),
-    '1mo': ('5y',  '1mo'),
-    '1y':  ('10y', '3mo'),
-}
+API_KEY = os.environ.get('ALPHA_VANTAGE_KEY', 'demo')
+BASE_URL = 'https://www.alphavantage.co/query'
 
-DEFAULT_SYMBOL = '^NSEI'
 VOLUME_MA_WINDOW = 30
 VOLUME_THRESHOLD = 0.20
 
-SYMBOL_FALLBACKS = {
-    '^NSEI': ['^NSEI', 'NSEI.NS', '^BSESN'],
+# Map our intervals to Alpha Vantage functions
+INTERVAL_MAP = {
+    '1d':  ('TIME_SERIES_DAILY_ADJUSTED',  'Time Series (Daily)'),
+    '1wk': ('TIME_SERIES_WEEKLY_ADJUSTED', 'Weekly Adjusted Time Series'),
+    '1mo': ('TIME_SERIES_MONTHLY_ADJUSTED','Monthly Adjusted Time Series'),
+    '1y':  ('TIME_SERIES_MONTHLY_ADJUSTED','Monthly Adjusted Time Series'),
 }
 
-def fetch_stock_data(symbol: str = DEFAULT_SYMBOL, interval: str = '1d') -> list[dict]:
-    period, yf_interval = INTERVAL_PERIOD_MAP.get(interval, ('1y', '1d'))
+# Alpha Vantage uses different symbol format (no .NS suffix)
+def convert_symbol(symbol: str) -> str:
+    if symbol == '^NSEI':
+        return 'NSEI'
+    if symbol.endswith('.NS'):
+        return symbol.replace('.NS', '.BSE')
+    return symbol
 
-    symbols_to_try = SYMBOL_FALLBACKS.get(symbol, [symbol])
-    if symbol not in symbols_to_try:
-        symbols_to_try = [symbol] + symbols_to_try
+def fetch_stock_data(symbol: str = '^NSEI', interval: str = '1d') -> list[dict]:
+    av_symbol = convert_symbol(symbol)
+    func, series_key = INTERVAL_MAP.get(interval, INTERVAL_MAP['1d'])
 
-    df = pd.DataFrame()
-    for sym in symbols_to_try:
+    params = {
+        'function':   func,
+        'symbol':     av_symbol,
+        'outputsize': 'full',
+        'apikey':     API_KEY,
+    }
+
+    try:
+        resp = requests.get(BASE_URL, params=params, timeout=30)
+        resp.raise_for_status()
+        json_data = resp.json()
+    except Exception as e:
+        raise RuntimeError(f'Alpha Vantage request failed: {e}')
+
+    if 'Information' in json_data:
+        raise RuntimeError('API rate limit reached. Wait 1 minute and retry.')
+
+    if series_key not in json_data:
+        return []
+
+    series = json_data[series_key]
+    rows = []
+    for date_str, vals in series.items():
         try:
-            ticker = yf.Ticker(sym)
-            df = ticker.history(period=period, interval=yf_interval)
-            if not df.empty:
-                break
+            rows.append({
+                'date':   date_str,
+                'open':   float(vals.get('1. open',            vals.get('1. open',  0))),
+                'high':   float(vals.get('2. high',            vals.get('2. high',  0))),
+                'low':    float(vals.get('3. low',             vals.get('3. low',   0))),
+                'close':  float(vals.get('5. adjusted close',  vals.get('4. close', 0))),
+                'volume': int(float(vals.get('6. volume',      vals.get('5. volume',0)))),
+            })
         except Exception:
             continue
 
-    if df.empty:
-        try:
-            df = yf.download(
-                symbols_to_try[0],
-                period=period,
-                interval=yf_interval,
-                progress=False,
-                auto_adjust=True,
-            )
-        except Exception:
-            pass
-
-    if df.empty:
+    if not rows:
         return []
 
-    df = df.reset_index()
-    df.columns = [str(col).lower().replace(' ', '_') for col in df.columns]
+    df = pd.DataFrame(rows)
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.sort_values('date').reset_index(drop=True)
 
-    date_col = next((c for c in df.columns if 'date' in c or 'datetime' in c), None)
-    if date_col is None:
-        return []
-    df = df.rename(columns={date_col: 'date'})
-
-    cols = ['date', 'open', 'high', 'low', 'close', 'volume']
-    df = df[[c for c in cols if c in df.columns]].copy()
-    df = df.dropna(subset=['close'])
-    df['volume'] = df['volume'].fillna(0).astype(int)
+    # Limit rows based on interval
+    limits = {'1d': 365, '1wk': 104, '1mo': 60, '1y': 120}
+    df = df.tail(limits.get(interval, 365))
 
     df['volume_ma30'] = df['volume'].rolling(window=VOLUME_MA_WINDOW, min_periods=1).mean()
     df['volume_high'] = df['volume'] > df['volume_ma30'] * (1 + VOLUME_THRESHOLD)
 
     result = []
     for _, row in df.iterrows():
-        try:
-            date_val = pd.Timestamp(row['date'])
-            if date_val.tzinfo is not None:
-                date_val = date_val.tz_convert(None)
-            date_str = date_val.strftime('%Y-%m-%d')
-        except Exception:
-            date_str = str(row['date'])[:10]
-
         result.append({
-            'date':        date_str,
-            'open':        round(float(row['open']),  2) if pd.notna(row.get('open'))  else None,
-            'high':        round(float(row['high']),  2) if pd.notna(row.get('high'))  else None,
-            'low':         round(float(row['low']),   2) if pd.notna(row.get('low'))   else None,
-            'close':       round(float(row['close']), 2) if pd.notna(row.get('close')) else None,
+            'date':        row['date'].strftime('%Y-%m-%d'),
+            'open':        round(row['open'],  2),
+            'high':        round(row['high'],  2),
+            'low':         round(row['low'],   2),
+            'close':       round(row['close'], 2),
             'volume':      int(row['volume']),
             'volume_ma30': round(float(row['volume_ma30']), 2),
             'volume_high': bool(row['volume_high']),
