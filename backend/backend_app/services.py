@@ -36,7 +36,7 @@ def fetch_stock_data(symbol: str = '^NSEI', interval: str = '1d') -> list[dict]:
     data = None
     for base in endpoints:
         try:
-            url = f'{base}{requests.utils.quote(symbol)}'
+            url = f'{base}{symbol}'
             resp = requests.get(url, params=params, headers=HEADERS, timeout=20)
             resp.raise_for_status()
             json_data = resp.json()
